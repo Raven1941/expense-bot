@@ -1,5 +1,4 @@
 import sqlite3
-import os
 from datetime import datetime
 
 
@@ -12,77 +11,161 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS expenses (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id     INTEGER,
-                    username    TEXT,
-                    amount      REAL,
-                    category    TEXT,
-                    description TEXT,
-                    date        TEXT,
-                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id      INTEGER,
+                    username     TEXT,
+                    amount       REAL,
+                    category     TEXT,
+                    description  TEXT,
+                    date         TEXT,
+                    excel_marked INTEGER DEFAULT 0,
+                    msg_chat_id  INTEGER,
+                    msg_id       INTEGER,
+                    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS income (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id      INTEGER,
+                    username     TEXT,
+                    amount       REAL,
+                    category     TEXT,
+                    description  TEXT,
+                    date         TEXT,
+                    excel_marked INTEGER DEFAULT 0,
+                    msg_chat_id  INTEGER,
+                    msg_id       INTEGER,
+                    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS config (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
                 )
             ''')
             conn.commit()
 
+    # ── Expenses ──────────────────────────────────────────────────────────────
     def add_expense(self, user_id, username, amount, category, description, date=None):
-        if date is None:
+        if not date:
             date = datetime.now().strftime('%Y-%m-%d')
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                'INSERT INTO expenses (user_id, username, amount, category, description, date) VALUES (?, ?, ?, ?, ?, ?)',
+            cur = conn.execute(
+                'INSERT INTO expenses (user_id,username,amount,category,description,date) VALUES (?,?,?,?,?,?)',
                 (user_id, username, amount, category, description, date)
             )
             conn.commit()
+            return cur.lastrowid
 
-    def delete_last(self, user_id):
-        """Delete the most recent expense for a user."""
+    def set_expense_message(self, exp_id, chat_id, msg_id):
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                'SELECT id FROM expenses WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
-                (user_id,)
+            conn.execute('UPDATE expenses SET msg_chat_id=?,msg_id=? WHERE id=?', (chat_id, msg_id, exp_id))
+            conn.commit()
+
+    def mark_expense_excel(self, exp_id, marked):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('UPDATE expenses SET excel_marked=? WHERE id=?', (1 if marked else 0, exp_id))
+            conn.commit()
+
+    def get_expense(self, exp_id):
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                'SELECT id,amount,category,description,date,excel_marked FROM expenses WHERE id=?', (exp_id,)
             )
-            row = cursor.fetchone()
+            return cur.fetchone()
+
+    def delete_last_expense(self, user_id):
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                'SELECT id FROM expenses WHERE user_id=? ORDER BY created_at DESC LIMIT 1', (user_id,)
+            )
+            row = cur.fetchone()
             if row:
-                conn.execute('DELETE FROM expenses WHERE id = ?', (row[0],))
+                conn.execute('DELETE FROM expenses WHERE id=?', (row[0],))
                 conn.commit()
                 return True
         return False
 
-    def get_monthly_summary(self, year=None, month=None):
-        if year is None:
-            year = datetime.now().year
-        if month is None:
-            month = datetime.now().month
-        month_str = f"{year}-{month:02d}"
+    def get_monthly_expenses(self, year=None, month=None):
+        y, m = year or datetime.now().year, month or datetime.now().month
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                '''SELECT category, SUM(amount) as total, COUNT(*) as count
-                   FROM expenses
-                   WHERE date LIKE ?
-                   GROUP BY category
-                   ORDER BY total DESC''',
-                (f"{month_str}%",)
+            cur = conn.execute(
+                '''SELECT category, SUM(amount), COUNT(*) FROM expenses
+                   WHERE date LIKE ? GROUP BY category ORDER BY SUM(amount) DESC''',
+                (f"{y}-{m:02d}%",)
             )
-            return cursor.fetchall()
+            return cur.fetchall()
 
-    def get_total_for_month(self, year=None, month=None):
-        if year is None:
-            year = datetime.now().year
-        if month is None:
-            month = datetime.now().month
-        month_str = f"{year}-{month:02d}"
+    def get_total_expenses(self, year=None, month=None):
+        y, m = year or datetime.now().year, month or datetime.now().month
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                'SELECT SUM(amount) FROM expenses WHERE date LIKE ?',
-                (f"{month_str}%",)
-            )
-            result = cursor.fetchone()
-            return result[0] or 0.0
+            cur = conn.execute('SELECT SUM(amount) FROM expenses WHERE date LIKE ?', (f"{y}-{m:02d}%",))
+            r = cur.fetchone()
+            return r[0] or 0.0
 
     def get_recent_expenses(self, limit=10):
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                'SELECT amount, category, description, date FROM expenses ORDER BY created_at DESC LIMIT ?',
-                (limit,)
+            cur = conn.execute(
+                'SELECT amount,category,description,date FROM expenses ORDER BY created_at DESC LIMIT ?', (limit,)
             )
-            return cursor.fetchall()
+            return cur.fetchall()
+
+    # ── Income ────────────────────────────────────────────────────────────────
+    def add_income(self, user_id, username, amount, category, description, date=None):
+        if not date:
+            date = datetime.now().strftime('%Y-%m-%d')
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                'INSERT INTO income (user_id,username,amount,category,description,date) VALUES (?,?,?,?,?,?)',
+                (user_id, username, amount, category, description, date)
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def set_income_message(self, inc_id, chat_id, msg_id):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('UPDATE income SET msg_chat_id=?,msg_id=? WHERE id=?', (chat_id, msg_id, inc_id))
+            conn.commit()
+
+    def mark_income_excel(self, inc_id, marked):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('UPDATE income SET excel_marked=? WHERE id=?', (1 if marked else 0, inc_id))
+            conn.commit()
+
+    def get_income(self, inc_id):
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                'SELECT id,amount,category,description,date,excel_marked FROM income WHERE id=?', (inc_id,)
+            )
+            return cur.fetchone()
+
+    def get_monthly_income(self, year=None, month=None):
+        y, m = year or datetime.now().year, month or datetime.now().month
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                '''SELECT category, SUM(amount), COUNT(*) FROM income
+                   WHERE date LIKE ? GROUP BY category ORDER BY SUM(amount) DESC''',
+                (f"{y}-{m:02d}%",)
+            )
+            return cur.fetchall()
+
+    def get_total_income(self, year=None, month=None):
+        y, m = year or datetime.now().year, month or datetime.now().month
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute('SELECT SUM(amount) FROM income WHERE date LIKE ?', (f"{y}-{m:02d}%",))
+            r = cur.fetchone()
+            return r[0] or 0.0
+
+    # ── Config ────────────────────────────────────────────────────────────────
+    def set_config(self, key, value):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('INSERT OR REPLACE INTO config (key,value) VALUES (?,?)', (key, str(value)))
+            conn.commit()
+
+    def get_config(self, key):
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute('SELECT value FROM config WHERE key=?', (key,))
+            r = cur.fetchone()
+            return r[0] if r else None
