@@ -1,270 +1,111 @@
 import os
+import re
 import logging
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
 )
 
 from database import Database
-from ocr import extract_amount_from_image
+from ocr import extract_from_image
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is not set.")
-
-# ─── Categories ──────────────────────────────────────────────────────────────
-CATEGORIES = {
-    '1': '🛒 Продукты',
-    '2': '🍽️ Кафе / Еда на вынос',
-    '3': '🚗 Транспорт / Бензин',
-    '4': '🏠 Дом / Коммунальные',
-    '5': '💊 Здоровье / Аптека',
-    '6': '🎉 Развлечения',
-    '7': '👗 Одежда',
-    '8': '📦 Другое',
-}
-
-MONTH_NAMES_RU = {
-    1: 'Январь', 2: 'Февраль', 3: 'Март', 4: 'Апрель',
-    5: 'Май', 6: 'Июнь', 7: 'Июль', 8: 'Август',
-    9: 'Сентябрь', 10: 'Октябрь', 11: 'Ноябрь', 12: 'Декабрь',
-}
+    raise RuntimeError('BOT_TOKEN not set')
 
 db = Database()
 
+# ── Categories ────────────────────────────────────────────────────────────────
+EXP_CATEGORIES = {
+    '1':  '🛒 Продукты',
+    '2':  '🍽️ Кафе / Еда на вынос',
+    '3':  '⛽ Авто / Бензин',
+    '4':  '🔧 Авто / Обслуживание',
+    '5':  '🏠 Дом / Коммунальные',
+    '6':  '💊 Здоровье / Аптека',
+    '7':  '🧴 Химия',
+    '8':  '👧 Мирослава',
+    '9':  '✈️ Командировка / Питание',
+    '10': '🎉 Развлечения',
+    '11': '👗 Одежда',
+    '12': '📦 Другое',
+}
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-def _category_keyboard(prefix: str) -> InlineKeyboardMarkup:
+INC_CATEGORIES = {
+    '1': '💼 Зарплата — Евгений',
+    '2': '💼 Зарплата — Анастасия',
+    '3': '✈️ Суточные / Командировочные',
+    '4': '💵 Другой доход',
+}
+
+MONTH_RU = {
+    1: 'Январь',   2: 'Февраль',  3: 'Март',    4: 'Апрель',
+    5: 'Май',      6: 'Июнь',     7: 'Июль',    8: 'Август',
+    9: 'Сентябрь', 10: 'Октябрь', 11: 'Ноябрь', 12: 'Декабрь',
+}
+
+
+# ── Keyboards ─────────────────────────────────────────────────────────────────
+def cat_keyboard(prefix='c') -> InlineKeyboardMarkup:
     rows, row = [], []
-    for key, label in CATEGORIES.items():
-        row.append(InlineKeyboardButton(label, callback_data=f"{prefix}|{key}"))
+    for k, v in EXP_CATEGORIES.items():
+        row.append(InlineKeyboardButton(v, callback_data=f'{prefix}|{k}'))
         if len(row) == 2:
-            rows.append(row)
-            row = []
+            rows.append(row); row = []
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
-def _expense_preview(amount: float, description: str) -> str:
-    desc_line = f"\n📝 *Описание:* {description}" if description else ""
-    return f"💰 *Сумма:* {amount:.2f} CAD{desc_line}\n\nВыберите категорию:"
+def line_cat_keyboard() -> InlineKeyboardMarkup:
+    """Category keyboard for receipt line items, with skip/done buttons."""
+    rows, row = [], []
+    for k, v in EXP_CATEGORIES.items():
+        row.append(InlineKeyboardButton(v, callback_data=f'rlcat|{k}'))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton('⏭️ Пропустить', callback_data='rl_skip'),
+        InlineKeyboardButton('✅ Завершить',   callback_data='rl_done'),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
-# ─── Command Handlers ─────────────────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 *Привет! Я трекер расходов.*\n\n"
-        "*Как добавить расход:*\n"
-        "• Напишите сумму: `250` или `250 магнит`\n"
-        "• Команда: `/add 250 магнит`\n"
-        "• Отправьте 📸 фото чека — прочитаю сумму сам\n\n"
-        "*Команды:*\n"
-        "/add — добавить расход\n"
-        "/summary — итоги за месяц\n"
-        "/last — последние 10 расходов\n"
-        "/undo — отменить последний расход\n"
-        "/categories — список категорий\n"
-        "/help — помощь",
-        parse_mode='Markdown'
+def inc_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(v, callback_data=f'ic|{k}')] for k, v in INC_CATEGORIES.items()]
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
+def excel_btn(record_type: str, record_id: int, marked: bool) -> InlineKeyboardMarkup:
+    label = '✅ В Excel' if marked else '⬜ Не в Excel'
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f'xls_{record_type}|{record_id}')]])
 
 
-async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "📋 *Категории:*\n\n" + "\n".join(f"{k}. {v}" for k, v in CATEGORIES.items())
-    await update.message.reply_text(text, parse_mode='Markdown')
+def ocr_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton('📋 По строкам',    callback_data='rl_start'),
+        InlineKeyboardButton('💰 Одна категория', callback_data='rl_one'),
+    ]])
 
 
-async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/add <amount> [description]"""
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Использование: `/add <сумма> [описание]`\nПример: `/add 250 магнит`",
-            parse_mode='Markdown'
-        )
-        return
-
-    try:
-        amount = float(context.args[0].replace(',', '.'))
-    except ValueError:
-        await update.message.reply_text("❌ Неверная сумма.", parse_mode='Markdown')
-        return
-
-    description = ' '.join(context.args[1:])
-    _store_pending(context, amount, description)
-
-    await update.message.reply_text(
-        _expense_preview(amount, description),
-        reply_markup=_category_keyboard('cat'),
-        parse_mode='Markdown'
-    )
+def split_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton('➕ Ещё часть', callback_data='split'),
+        InlineKeyboardButton('✅ Готово',    callback_data='split_done'),
+    ]])
 
 
-async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now()
-    rows = db.get_monthly_summary()
-    total = db.get_total_for_month()
-
-    if not rows:
-        await update.message.reply_text("📊 В этом месяце расходов пока нет.")
-        return
-
-    text = f"📊 *Расходы за {MONTH_NAMES_RU[now.month]} {now.year}:*\n\n"
-    for category, cat_total, count in rows:
-        pct = (cat_total / total * 100) if total else 0
-        text += f"{category}\n  `{cat_total:.2f} CAD` ({pct:.0f}%) — {count} оп.\n\n"
-
-    text += f"━━━━━━━━━━━━━━\n💳 *Итого: {total:.2f} CAD*"
-    await update.message.reply_text(text, parse_mode='Markdown')
-
-
-async def last_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.get_recent_expenses(10)
-    if not rows:
-        await update.message.reply_text("📋 Расходов пока нет.")
-        return
-
-    text = "📋 *Последние расходы:*\n\n"
-    for amount, category, description, date in rows:
-        desc = f" — {description}" if description else ""
-        text += f"• {date} | `{amount:.2f} CAD` | {category}{desc}\n"
-
-    await update.message.reply_text(text, parse_mode='Markdown')
-
-
-async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    deleted = db.delete_last(user.id)
-    if deleted:
-        await update.message.reply_text("↩️ Последний расход удалён.")
-    else:
-        await update.message.reply_text("❌ Нечего удалять.")
-
-
-# ─── Message Handlers ─────────────────────────────────────────────────────────
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    # If we're waiting for a manual amount after failed OCR
-    if context.user_data.get('waiting_for_amount'):
-        try:
-            amount = float(text.replace(',', '.'))
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Введите только число, например: `45.50`", parse_mode='Markdown'
-            )
-            return
-        context.user_data.pop('waiting_for_amount', None)
-        _store_pending(context, amount, 'Чек (фото)')
-        await update.message.reply_text(
-            _expense_preview(amount, 'Чек (фото)'),
-            reply_markup=_category_keyboard('cat'),
-            parse_mode='Markdown'
-        )
-        return
-
-    # Natural text: "250" or "250 магнит"
-    import re
-    match = re.match(r'^(\d+(?:[.,]\d+)?)\s*(.*)$', text)
-    if not match:
-        return  # Not an expense entry — ignore
-
-    try:
-        amount = float(match.group(1).replace(',', '.'))
-    except ValueError:
-        return
-
-    description = match.group(2).strip()
-    _store_pending(context, amount, description)
-
-    await update.message.reply_text(
-        _expense_preview(amount, description),
-        reply_markup=_category_keyboard('cat'),
-        parse_mode='Markdown'
-    )
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("📸 Читаю чек, подождите…")
-
-    photo = update.message.photo[-1]
-    photo_file = await context.bot.get_file(photo.file_id)
-    photo_bytes = bytes(await photo_file.download_as_bytearray())
-
-    amount = extract_amount_from_image(photo_bytes)
-
-    if amount:
-        _store_pending(context, amount, 'Чек (фото)')
-        await status_msg.edit_text(
-            f"✅ *Сумма найдена:* {amount:.2f} CAD\n\nВыберите категорию:",
-            reply_markup=_category_keyboard('cat'),
-            parse_mode='Markdown'
-        )
-    else:
-        context.user_data['waiting_for_amount'] = True
-        await status_msg.edit_text(
-            "❌ Не удалось прочитать сумму автоматически.\n\n"
-            "Введите сумму вручную (например: `45.50`):",
-            parse_mode='Markdown'
-        )
-
-
-# ─── Callback Handler ─────────────────────────────────────────────────────────
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split('|')
-    action, cat_key = parts[0], parts[1]
-
-    if action == 'cat':
-        category = CATEGORIES.get(cat_key, '📦 Другое')
-        pending = context.user_data.get('pending')
-
-        if not pending:
-            await query.edit_message_text("❌ Сессия истекла. Начните заново.")
-            return
-
-        user = query.from_user
-        db.add_expense(
-            user_id=user.id,
-            username=user.username or user.first_name,
-            amount=pending['amount'],
-            category=category,
-            description=pending['description'],
-            date=pending['date'],
-        )
-        context.user_data.pop('pending', None)
-
-        await query.edit_message_text(
-            f"✅ *Сохранено!*\n\n"
-            f"💰 {pending['amount']:.2f} CAD\n"
-            f"🏷️ {category}\n"
-            f"📝 {pending['description'] or '—'}\n"
-            f"📅 {pending['date']}",
-            parse_mode='Markdown'
-        )
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-def _store_pending(context: ContextTypes.DEFAULT_TYPE, amount: float, description: str):
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _store_pending(context, amount: float, description: str):
     context.user_data['pending'] = {
         'amount': amount,
         'description': description,
@@ -272,13 +113,581 @@ def _store_pending(context: ContextTypes.DEFAULT_TYPE, amount: float, descriptio
     }
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+def _expense_preview(amount: float, description: str) -> str:
+    desc = f'\n📝 *Описание:* {description}' if description else ''
+    return f'💰 *Сумма:* {amount:.2f} CAD{desc}\n\nВыберите категорию:'
+
+
+def _format_receipt_summary(lines: list, total: float | None) -> str:
+    text = '📄 *Строки чека:*\n\n'
+    for i, item in enumerate(lines, 1):
+        text += f'`{i}.` {item["name"]} — `{item["amount"]:.2f} CAD`\n'
+    text += '\n━━━━━━━━━━━━━━\n'
+    if total:
+        text += f'💰 *Итого: {total:.2f} CAD*\n\n'
+    text += 'Как сохранить расходы?'
+    return text
+
+
+def _current_line_prompt(context) -> str:
+    receipt = context.user_data.get('receipt', {})
+    lines   = receipt.get('lines', [])
+    index   = receipt.get('index', 0)
+    total   = len(lines)
+
+    if index >= total:
+        return ''
+
+    item = lines[index]
+    return (
+        f'📋 *Строка {index + 1} из {total}*\n\n'
+        f'🏷️ {item["name"]}\n'
+        f'💰 `{item["amount"]:.2f} CAD`\n\n'
+        f'Выберите категорию или пропустите:'
+    )
+
+
+async def _post_expense(context, exp_id, amount, category, description, date, username):
+    group_id = db.get_config('group_id')
+    topic_id = db.get_config('topic_expenses')
+    if not group_id or not topic_id:
+        return
+    text = (
+        f'💸 *Расход*\n'
+        f'💰 `{amount:.2f} CAD`\n'
+        f'🏷️ {category}\n'
+        f'📝 {description or "—"}\n'
+        f'📅 {date} | 👤 {username}'
+    )
+    try:
+        kwargs = dict(
+            chat_id=int(group_id),
+            text=text,
+            parse_mode='Markdown',
+            reply_markup=excel_btn('e', exp_id, False),
+        )
+        tid = int(topic_id)
+        if tid:
+            kwargs['message_thread_id'] = tid
+        msg = await context.bot.send_message(**kwargs)
+        db.set_expense_message(exp_id, int(group_id), msg.message_id)
+    except Exception as e:
+        logger.error(f'Post expense failed: {e}')
+
+
+async def _post_income(context, inc_id, amount, category, description, date, username):
+    group_id = db.get_config('group_id')
+    topic_id = db.get_config('topic_income')
+    if not group_id or not topic_id:
+        return
+    text = (
+        f'💰 *Доход*\n'
+        f'💵 `{amount:.2f} CAD`\n'
+        f'🏷️ {category}\n'
+        f'📝 {description or "—"}\n'
+        f'📅 {date} | 👤 {username}'
+    )
+    try:
+        kwargs = dict(
+            chat_id=int(group_id),
+            text=text,
+            parse_mode='Markdown',
+            reply_markup=excel_btn('i', inc_id, False),
+        )
+        tid = int(topic_id)
+        if tid:
+            kwargs['message_thread_id'] = tid
+        msg = await context.bot.send_message(**kwargs)
+        db.set_income_message(inc_id, int(group_id), msg.message_id)
+    except Exception as e:
+        logger.error(f'Post income failed: {e}')
+
+
+async def _save_and_next_line(query, context, category: str):
+    """Save current receipt line, then advance to next."""
+    receipt  = context.user_data.get('receipt', {})
+    lines    = receipt.get('lines', [])
+    index    = receipt.get('index', 0)
+    date     = receipt.get('date', datetime.now().strftime('%Y-%m-%d'))
+    user     = query.from_user
+
+    if index >= len(lines):
+        await query.edit_message_text('✅ Все строки обработаны.')
+        return
+
+    item   = lines[index]
+    exp_id = db.add_expense(
+        user_id=user.id,
+        username=user.username or user.first_name,
+        amount=item['amount'],
+        category=category,
+        description=item['name'],
+        date=date,
+    )
+    await _post_expense(
+        context, exp_id,
+        item['amount'], category,
+        item['name'], date,
+        user.username or user.first_name,
+    )
+
+    # Advance index
+    receipt['index'] = index + 1
+    context.user_data['receipt'] = receipt
+
+    next_index = index + 1
+    if next_index >= len(lines):
+        total = receipt.get('total')
+        total_text = f'\n💰 *Итого по чеку: {total:.2f} CAD*' if total else ''
+        await query.edit_message_text(
+            f'✅ *Все строки сохранены!*{total_text}\n\n'
+            f'Все позиции отправлены в раздел Расходы.',
+            parse_mode='Markdown'
+        )
+        context.user_data.pop('receipt', None)
+    else:
+        receipt['index'] = next_index
+        context.user_data['receipt'] = receipt
+        await query.edit_message_text(
+            _current_line_prompt(context),
+            reply_markup=line_cat_keyboard(),
+            parse_mode='Markdown'
+        )
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        '👋 *Трекер расходов и доходов*\n\n'
+        '*Добавить расход:*\n'
+        '• Напишите: `250 магнит`\n'
+        '• `/add 250 магнит`\n'
+        '• 📸 Фото чека — читаю строки автоматически\n\n'
+        '*Добавить доход:*\n'
+        '• `/income 5000 зарплата`\n\n'
+        '*Команды:*\n'
+        '/summary — итоги месяца\n'
+        '/last — последние 10 расходов\n'
+        '/undo — отменить последний расход\n'
+        '/categories — все категории\n'
+        '/setup — настройка топиков (в группе)\n',
+        parse_mode='Markdown'
+    )
+
+
+async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            '*Настройка топиков:*\n\n'
+            'Зайдите в каждый топик и отправьте:\n'
+            '`/setup input` — топик ввода\n'
+            '`/setup expenses` — топик расходов\n'
+            '`/setup income` — топик доходов',
+            parse_mode='Markdown'
+        )
+        return
+
+    action  = context.args[0].lower()
+    mapping = {'input': 'topic_input', 'expenses': 'topic_expenses', 'income': 'topic_income'}
+
+    if action not in mapping:
+        await update.message.reply_text('❌ Используйте: input, expenses, income')
+        return
+
+    chat_id   = update.effective_chat.id
+    thread_id = update.message.message_thread_id or 0
+
+    db.set_config('group_id', str(chat_id))
+    db.set_config(mapping[action], str(thread_id))
+
+    await update.message.reply_text(
+        f'✅ Топик *{action}* зарегистрирован.\n'
+        f'Chat: `{chat_id}` | Thread: `{thread_id}`',
+        parse_mode='Markdown'
+    )
+
+
+async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text('Пример: `/add 250 магнит`', parse_mode='Markdown')
+        return
+    try:
+        amount = float(context.args[0].replace(',', '.'))
+    except ValueError:
+        await update.message.reply_text('❌ Неверная сумма.')
+        return
+    description = ' '.join(context.args[1:])
+    _store_pending(context, amount, description)
+    await update.message.reply_text(
+        _expense_preview(amount, description), reply_markup=cat_keyboard(), parse_mode='Markdown'
+    )
+
+
+async def income_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text('Пример: `/income 5000 зарплата`', parse_mode='Markdown')
+        return
+    try:
+        amount = float(context.args[0].replace(',', '.'))
+    except ValueError:
+        await update.message.reply_text('❌ Неверная сумма.')
+        return
+    description = ' '.join(context.args[1:])
+    context.user_data['pending_income'] = {
+        'amount': amount, 'description': description,
+        'date': datetime.now().strftime('%Y-%m-%d'),
+    }
+    await update.message.reply_text(
+        f'💵 *Доход:* {amount:.2f} CAD\n📝 {description or "—"}\n\nВыберите категорию:',
+        reply_markup=inc_keyboard(), parse_mode='Markdown'
+    )
+
+
+async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now       = datetime.now()
+    exp_rows  = db.get_monthly_expenses()
+    total_exp = db.get_total_expenses()
+    total_inc = db.get_total_income()
+
+    text = f'📊 *{MONTH_RU[now.month]} {now.year}*\n\n'
+
+    if exp_rows:
+        text += '*💸 Расходы:*\n'
+        for cat, total, count in exp_rows:
+            pct = (total / total_exp * 100) if total_exp else 0
+            text += f'{cat}\n  `{total:.2f} CAD` ({pct:.0f}%) — {count} оп.\n\n'
+        text += f'━━━━━━━━━━━━━━\n💳 *Расходы итого: {total_exp:.2f} CAD*\n'
+    else:
+        text += '_Расходов нет_\n'
+
+    text += f'💰 *Доходы итого: {total_inc:.2f} CAD*'
+
+    if total_inc > 0 or total_exp > 0:
+        balance = total_inc - total_exp
+        sign    = '+' if balance >= 0 else ''
+        emoji   = '📈' if balance >= 0 else '📉'
+        text   += f'\n{emoji} *Баланс: {sign}{balance:.2f} CAD*'
+
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+
+async def last_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db.get_recent_expenses(10)
+    if not rows:
+        await update.message.reply_text('Расходов пока нет.')
+        return
+    text = '📋 *Последние расходы:*\n\n'
+    for amount, cat, desc, date in rows:
+        d     = f' — {desc}' if desc else ''
+        text += f'• {date} | `{amount:.2f}` | {cat}{d}\n'
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+
+async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if db.delete_last_expense(update.effective_user.id):
+        await update.message.reply_text('↩️ Последний расход удалён.')
+    else:
+        await update.message.reply_text('Нечего удалять.')
+
+
+async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text  = '📋 *Категории расходов:*\n'
+    text += '\n'.join(f'  {k}. {v}' for k, v in EXP_CATEGORIES.items())
+    text += '\n\n💵 *Категории доходов:*\n'
+    text += '\n'.join(f'  {k}. {v}' for k, v in INC_CATEGORIES.items())
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+
+# ── Message Handlers ──────────────────────────────────────────────────────────
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if context.user_data.get('waiting_for_amount'):
+        try:
+            amount = float(text.replace(',', '.'))
+        except ValueError:
+            await update.message.reply_text('❌ Введите только число: `45.50`', parse_mode='Markdown')
+            return
+        context.user_data.pop('waiting_for_amount', None)
+        _store_pending(context, amount, 'Чек (фото)')
+        await update.message.reply_text(
+            _expense_preview(amount, 'Чек (фото)'), reply_markup=cat_keyboard(), parse_mode='Markdown'
+        )
+        return
+
+    if context.user_data.get('waiting_split_amount'):
+        try:
+            amount = float(text.replace(',', '.'))
+        except ValueError:
+            await update.message.reply_text('❌ Введите только число: `45.50`', parse_mode='Markdown')
+            return
+        context.user_data.pop('waiting_split_amount', None)
+        last = context.user_data.get('last_saved', {})
+        _store_pending(context, amount, last.get('description', ''))
+        await update.message.reply_text(
+            _expense_preview(amount, last.get('description', '')),
+            reply_markup=cat_keyboard(), parse_mode='Markdown'
+        )
+        return
+
+    match = re.match(r'^(\d+(?:[.,]\d+)?)\s*(.*)$', text)
+    if not match:
+        return
+    try:
+        amount = float(match.group(1).replace(',', '.'))
+    except ValueError:
+        return
+    description = match.group(2).strip()
+    _store_pending(context, amount, description)
+    await update.message.reply_text(
+        _expense_preview(amount, description), reply_markup=cat_keyboard(), parse_mode='Markdown'
+    )
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = await update.message.reply_text('📸 Читаю чек, подождите…')
+
+    photo       = update.message.photo[-1]
+    photo_file  = await context.bot.get_file(photo.file_id)
+    photo_bytes = bytes(await photo_file.download_as_bytearray())
+
+    ocr_text, lines, total = extract_from_image(photo_bytes)
+
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    if lines:
+        # Store receipt data for line-by-line processing
+        context.user_data['receipt'] = {
+            'lines': lines,
+            'index': 0,
+            'total': total,
+            'date':  today,
+        }
+        # Also store total as fallback for single-category mode
+        if total:
+            context.user_data['ocr_amount'] = total
+            context.user_data['ocr_desc']   = 'Чек (фото)'
+
+        await status.edit_text(
+            _format_receipt_summary(lines, total),
+            reply_markup=ocr_mode_keyboard(),
+            parse_mode='Markdown'
+        )
+
+    elif total:
+        # No line items parsed but found a total — single category flow
+        context.user_data['ocr_amount'] = total
+        context.user_data['ocr_desc']   = 'Чек (фото)'
+
+        raw = (ocr_text[:400] + '…') if ocr_text and len(ocr_text) > 400 else (ocr_text or '—')
+        await status.edit_text(
+            f'📄 *Текст с чека:*\n```\n{raw}\n```\n\n'
+            f'💰 *Найденная сумма:* {total:.2f} CAD\n\n'
+            f'Подтвердите или измените:',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(f'✅ Верно — {total:.2f} CAD', callback_data='ocr_ok'),
+                InlineKeyboardButton('✏️ Изменить', callback_data='ocr_edit'),
+            ]]),
+            parse_mode='Markdown'
+        )
+
+    else:
+        context.user_data['waiting_for_amount'] = True
+        raw = (ocr_text[:400] + '…') if ocr_text and len(ocr_text) > 400 else (ocr_text or '—')
+        await status.edit_text(
+            f'📄 *Текст с чека:*\n```\n{raw}\n```\n\n'
+            f'❌ Сумма не найдена. Введите вручную:',
+            parse_mode='Markdown'
+        )
+
+
+# ── Callback Handler ──────────────────────────────────────────────────────────
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user = query.from_user
+
+    # ── Receipt mode selection ─────────────────────────────────────────────
+    if data == 'rl_start':
+        # Line-by-line mode
+        receipt = context.user_data.get('receipt')
+        if not receipt or not receipt.get('lines'):
+            await query.edit_message_text('❌ Нет данных о строках.')
+            return
+        receipt['index'] = 0
+        context.user_data['receipt'] = receipt
+        await query.edit_message_text(
+            _current_line_prompt(context),
+            reply_markup=line_cat_keyboard(),
+            parse_mode='Markdown'
+        )
+
+    elif data == 'rl_one':
+        # Single category mode for whole receipt
+        amount = context.user_data.pop('ocr_amount', None)
+        desc   = context.user_data.pop('ocr_desc', 'Чек (фото)')
+        context.user_data.pop('receipt', None)
+        if not amount:
+            receipt = context.user_data.get('receipt', {})
+            amount  = receipt.get('total')
+        if not amount:
+            await query.edit_message_text('❌ Нет данных о сумме.')
+            return
+        _store_pending(context, amount, desc)
+        await query.edit_message_text(
+            _expense_preview(amount, desc), reply_markup=cat_keyboard(), parse_mode='Markdown'
+        )
+
+    # ── Receipt line category selected ─────────────────────────────────────
+    elif data.startswith('rlcat|'):
+        category = EXP_CATEGORIES.get(data.split('|')[1], '📦 Другое')
+        await _save_and_next_line(query, context, category)
+
+    elif data == 'rl_skip':
+        receipt = context.user_data.get('receipt', {})
+        lines   = receipt.get('lines', [])
+        index   = receipt.get('index', 0)
+        receipt['index'] = index + 1
+        context.user_data['receipt'] = receipt
+
+        if index + 1 >= len(lines):
+            await query.edit_message_text('✅ Готово. Все строки обработаны.')
+            context.user_data.pop('receipt', None)
+        else:
+            await query.edit_message_text(
+                _current_line_prompt(context),
+                reply_markup=line_cat_keyboard(),
+                parse_mode='Markdown'
+            )
+
+    elif data == 'rl_done':
+        context.user_data.pop('receipt', None)
+        await query.edit_message_text('✅ Готово.')
+
+    # ── Regular expense category selected ─────────────────────────────────
+    elif data.startswith('c|'):
+        category = EXP_CATEGORIES.get(data.split('|')[1], '📦 Другое')
+        pending  = context.user_data.get('pending')
+        if not pending:
+            await query.edit_message_text('❌ Сессия истекла. Начните заново.')
+            return
+
+        exp_id = db.add_expense(
+            user_id=user.id,
+            username=user.username or user.first_name,
+            amount=pending['amount'],
+            category=category,
+            description=pending['description'],
+            date=pending['date'],
+        )
+        await _post_expense(
+            context, exp_id,
+            pending['amount'], category,
+            pending['description'], pending['date'],
+            user.username or user.first_name,
+        )
+        context.user_data['last_saved'] = pending.copy()
+        context.user_data.pop('pending', None)
+
+        await query.edit_message_text(
+            f'✅ *Сохранено!*\n'
+            f'💰 {pending["amount"]:.2f} CAD | {category}\n'
+            f'📝 {pending["description"] or "—"} | 📅 {pending["date"]}\n\n'
+            f'Разделить этот чек на ещё одну категорию?',
+            reply_markup=split_keyboard(),
+            parse_mode='Markdown'
+        )
+
+    # ── Split bill ─────────────────────────────────────────────────────────
+    elif data == 'split':
+        context.user_data['waiting_split_amount'] = True
+        await query.edit_message_text('➕ Введите сумму следующей части:')
+
+    elif data == 'split_done':
+        context.user_data.pop('last_saved', None)
+        await query.edit_message_text('✅ Чек полностью сохранён.')
+
+    # ── OCR single total confirm ───────────────────────────────────────────
+    elif data == 'ocr_ok':
+        amount = context.user_data.pop('ocr_amount', None)
+        desc   = context.user_data.pop('ocr_desc', 'Чек (фото)')
+        if not amount:
+            await query.edit_message_text('❌ Сессия истекла.')
+            return
+        _store_pending(context, amount, desc)
+        await query.edit_message_text(
+            _expense_preview(amount, desc), reply_markup=cat_keyboard(), parse_mode='Markdown'
+        )
+
+    elif data == 'ocr_edit':
+        context.user_data.pop('ocr_amount', None)
+        context.user_data['waiting_for_amount'] = True
+        await query.edit_message_text('✏️ Введите сумму вручную:')
+
+    # ── Income category selected ───────────────────────────────────────────
+    elif data.startswith('ic|'):
+        category = INC_CATEGORIES.get(data.split('|')[1], '💵 Другой доход')
+        pending  = context.user_data.get('pending_income')
+        if not pending:
+            await query.edit_message_text('❌ Сессия истекла.')
+            return
+
+        inc_id = db.add_income(
+            user_id=user.id,
+            username=user.username or user.first_name,
+            amount=pending['amount'],
+            category=category,
+            description=pending['description'],
+            date=pending['date'],
+        )
+        await _post_income(
+            context, inc_id,
+            pending['amount'], category,
+            pending['description'], pending['date'],
+            user.username or user.first_name,
+        )
+        context.user_data.pop('pending_income', None)
+
+        await query.edit_message_text(
+            f'✅ *Доход сохранён!*\n'
+            f'💵 {pending["amount"]:.2f} CAD\n'
+            f'🏷️ {category}\n'
+            f'📝 {pending["description"] or "—"}',
+            parse_mode='Markdown'
+        )
+
+    # ── Excel marking ──────────────────────────────────────────────────────
+    elif data.startswith('xls_e|'):
+        exp_id = int(data.split('|')[1])
+        row    = db.get_expense(exp_id)
+        if not row:
+            return
+        _, amount, category, description, date, marked = row
+        new = not bool(marked)
+        db.mark_expense_excel(exp_id, new)
+        await query.edit_message_reply_markup(reply_markup=excel_btn('e', exp_id, new))
+
+    elif data.startswith('xls_i|'):
+        inc_id = int(data.split('|')[1])
+        row    = db.get_income(inc_id)
+        if not row:
+            return
+        _, amount, category, description, date, marked = row
+        new = not bool(marked)
+        db.mark_income_excel(inc_id, new)
+        await query.edit_message_reply_markup(reply_markup=excel_btn('i', inc_id, new))
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler('start',      start))
-    app.add_handler(CommandHandler('help',       help_command))
+    app.add_handler(CommandHandler('help',       start))
+    app.add_handler(CommandHandler('setup',      setup_command))
     app.add_handler(CommandHandler('add',        add_command))
+    app.add_handler(CommandHandler('income',     income_command))
     app.add_handler(CommandHandler('summary',    summary_command))
     app.add_handler(CommandHandler('last',       last_command))
     app.add_handler(CommandHandler('undo',       undo_command))
@@ -287,7 +696,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Bot is running…")
+    logger.info('Bot started.')
     app.run_polling(drop_pending_updates=True)
 
 
