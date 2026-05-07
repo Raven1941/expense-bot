@@ -157,13 +157,18 @@ async def _post_expense(context, exp_id, amount, category, description, date, us
         f'📅 {date} | 👤 {username}'
     )
     try:
-        kwargs = dict(chat_id=int(group_id), text=text, parse_mode='Markdown',
-                      reply_markup=excel_btn('e', exp_id, False))
+        kwargs = dict(chat_id=int(group_id), text=text, parse_mode='Markdown')
         tid = int(topic_id)
         if tid:
             kwargs['message_thread_id'] = tid
         msg = await context.bot.send_message(**kwargs)
         db.set_expense_message(exp_id, int(group_id), msg.message_id)
+        # Add button in separate edit — more reliable in forum topics
+        await context.bot.edit_message_reply_markup(
+            chat_id=int(group_id),
+            message_id=msg.message_id,
+            reply_markup=excel_btn('e', exp_id, False)
+        )
     except Exception as e:
         logger.error(f'_post_expense error: {e}')
 
@@ -182,13 +187,18 @@ async def _post_income(context, inc_id, amount, category, description, date, use
         f'📅 {date} | 👤 {username}'
     )
     try:
-        kwargs = dict(chat_id=int(group_id), text=text, parse_mode='Markdown',
-                      reply_markup=excel_btn('i', inc_id, False))
+        kwargs = dict(chat_id=int(group_id), text=text, parse_mode='Markdown')
         tid = int(topic_id)
         if tid:
             kwargs['message_thread_id'] = tid
         msg = await context.bot.send_message(**kwargs)
         db.set_income_message(inc_id, int(group_id), msg.message_id)
+        # Add button in separate edit — more reliable in forum topics
+        await context.bot.edit_message_reply_markup(
+            chat_id=int(group_id),
+            message_id=msg.message_id,
+            reply_markup=excel_btn('i', inc_id, False)
+        )
     except Exception as e:
         logger.error(f'_post_income error: {e}')
 
