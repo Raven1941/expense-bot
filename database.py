@@ -77,16 +77,23 @@ class Database:
             return cur.fetchone()
 
     def delete_last_expense(self, user_id):
+        """
+        Delete the most recent expense for a user.
+        Returns (msg_chat_id, msg_id) so the caller can delete the Telegram message,
+        or (None, None) if nothing was deleted.
+        """
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute(
-                'SELECT id FROM expenses WHERE user_id=? ORDER BY created_at DESC LIMIT 1', (user_id,)
+                'SELECT id, msg_chat_id, msg_id FROM expenses WHERE user_id=? ORDER BY created_at DESC LIMIT 1',
+                (user_id,)
             )
             row = cur.fetchone()
             if row:
-                conn.execute('DELETE FROM expenses WHERE id=?', (row[0],))
+                exp_id, msg_chat_id, msg_id = row
+                conn.execute('DELETE FROM expenses WHERE id=?', (exp_id,))
                 conn.commit()
-                return True
-        return False
+                return msg_chat_id, msg_id
+        return None, None
 
     def get_monthly_expenses(self, year=None, month=None):
         y, m = year or datetime.now().year, month or datetime.now().month
@@ -157,6 +164,40 @@ class Database:
             cur = conn.execute('SELECT SUM(amount) FROM income WHERE date LIKE ?', (f"{y}-{m:02d}%",))
             r = cur.fetchone()
             return r[0] or 0.0
+
+    def get_expenses_by_excel(self, marked: bool, limit=20):
+        """Get expenses filtered by excel status."""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                '''SELECT id, amount, category, description, date
+                   FROM expenses WHERE excel_marked=?
+                   ORDER BY created_at DESC LIMIT ?''',
+                (1 if marked else 0, limit)
+            )
+            return cur.fetchall()
+
+    def get_income_by_excel(self, marked: bool, limit=20):
+        """Get income filtered by excel status."""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                '''SELECT id, amount, category, description, date
+                   FROM income WHERE excel_marked=?
+                   ORDER BY created_at DESC LIMIT ?''',
+                (1 if marked else 0, limit)
+            )
+            return cur.fetchall()
+
+    def mark_all_expenses_excel(self, marked=True):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('UPDATE expenses SET excel_marked=? WHERE excel_marked=?',
+                         (1 if marked else 0, 0 if marked else 1))
+            conn.commit()
+
+    def mark_all_income_excel(self, marked=True):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('UPDATE income SET excel_marked=? WHERE excel_marked=?',
+                         (1 if marked else 0, 0 if marked else 1))
+            conn.commit()
 
     # ── Config ────────────────────────────────────────────────────────────────
     def set_config(self, key, value):
