@@ -3,7 +3,7 @@ import re
 import logging
 from datetime import datetime
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
@@ -421,10 +421,20 @@ async def last_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if db.delete_last_expense(update.effective_user.id):
-        await update.message.reply_text('↩️ Последний расход удалён.')
-    else:
+    msg_chat_id, msg_id = db.delete_last_expense(update.effective_user.id)
+
+    if msg_chat_id is None:
         await update.message.reply_text('Нечего удалять.')
+        return
+
+    # Delete message from expenses topic
+    if msg_chat_id and msg_id:
+        try:
+            await context.bot.delete_message(chat_id=msg_chat_id, message_id=msg_id)
+        except Exception as e:
+            logger.warning(f'Could not delete topic message: {e}')
+
+    await update.message.reply_text('↩️ Последний расход удалён.')
 
 
 async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -433,6 +443,55 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text += '\n\n<b>💵 Категории доходов:</b>\n'
     text += '\n'.join(f'  {k}. {v}' for k, v in INC_CATEGORIES.items())
     await update.message.reply_text(text, parse_mode='HTML')
+
+
+async def excel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton('⬜ Расходы — не в Excel', callback_data='exf|e|0'),
+            InlineKeyboardButton('✅ Расходы — в Excel',    callback_data='exf|e|1'),
+        ],
+        [
+            InlineKeyboardButton('⬜ Доходы — не в Excel',  callback_data='exf|i|0'),
+            InlineKeyboardButton('✅ Доходы — в Excel',     callback_data='exf|i|1'),
+        ],
+    ])
+    await update.message.reply_text(
+        '📊 <b>Статус Excel</b>\n\nЧто показать?',
+        reply_markup=keyboard,
+        parse_mode='HTML'
+    )
+
+
+def _build_excel_list(rows: list, record_type: str, marked: bool) -> tuple:
+    """Returns (text, InlineKeyboardMarkup or None)"""
+    type_label = 'Расходы' if record_type == 'e' else 'Доходы'
+    icon       = '💸' if record_type == 'e' else '💰'
+    status     = '✅ В Excel' if marked else '⬜ Не в Excel'
+
+    if not rows:
+        return f'{icon} <b>{type_label} — {status}:</b>\n\n<i>Записей нет.</i>', None
+
+    text     = f'{icon} <b>{type_label} — {status} ({len(rows)}):</b>\n\n'
+    btn_rows, row = [], []
+
+    for i, (rec_id, amount, category, description, date) in enumerate(rows, 1):
+        short_date = date[5:] if date else '—'
+        desc       = f' | {description}' if description else ''
+        text      += f'{i}. {short_date} | <code>{amount:.2f}</code> | {category}{desc}\n'
+
+        label = f'✅ #{i}' if not marked else f'↩️ #{i}'
+        row.append(InlineKeyboardButton(label, callback_data=f'mxls_{record_type}|{rec_id}'))
+        if len(row) == 4:
+            btn_rows.append(row); row = []
+
+    if row:
+        btn_rows.append(row)
+
+    if not marked:
+        btn_rows.append([InlineKeyboardButton('✅ Отметить все', callback_data=f'mxls_all_{record_type}')])
+
+    return text, InlineKeyboardMarkup(btn_rows) if btn_rows else None
 
 
 # ── Text / Photo Handlers ─────────────────────────────────────────────────────
@@ -672,6 +731,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='HTML'
             )
 
+        # ── Excel filter view ─────────────────────────────────────────────
+        elif data.startswith('exf|'):
+            _, rtype, mval = data.split('|')
+            marked = mval == '1'
+            rows   = (db.get_expenses_by_excel(marked) if rtype == 'e'
+                      else db.get_income_by_excel(marked))
+            text, markup = _build_excel_list(rows, rtype, marked)
+            await query.edit_message_text(text, reply_markup=markup, parse_mode='HTML')
+
+        elif data.startswith('mxls_all_'):
+            rtype = data[-1]   # 'e' or 'i'
+            if rtype == 'e':
+                db.mark_all_expenses_excel(True)
+            else:
+                db.mark_all_income_excel(True)
+            await query.answer('✅ Все отмечены как В Excel')
+            await query.edit_message_text(
+                '✅ <b>Все записи отмечены как В Excel.</b>', parse_mode='HTML'
+            )
+
         # ── Excel toggle ──────────────────────────────────────────────────
         elif data.startswith('xls_e|'):
             exp_id = int(data.split('|')[1])
@@ -697,8 +776,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+async def post_init(application: Application):
+    """Set bot command menu — shows as '/' button in Telegram."""
+    await application.bot.set_my_commands([
+        BotCommand('add',           '➕ Добавить расход'),
+        BotCommand('income',        '💵 Добавить доход'),
+        BotCommand('summary',       '📊 Итоги за месяц'),
+        BotCommand('last',          '📋 Последние расходы'),
+        BotCommand('excel',         '📑 Статус Excel'),
+        BotCommand('undo',          '↩️ Отменить последний расход'),
+        BotCommand('categories',    '🏷 Категории'),
+        BotCommand('create_topics', '⚙️ Создать топики'),
+    ])
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler('start',         start))
     app.add_handler(CommandHandler('help',          start))
@@ -709,6 +802,7 @@ def main():
     app.add_handler(CommandHandler('last',          last_command))
     app.add_handler(CommandHandler('undo',          undo_command))
     app.add_handler(CommandHandler('categories',    categories_command))
+    app.add_handler(CommandHandler('excel',         excel_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
