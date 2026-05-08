@@ -115,7 +115,78 @@ def excel_btn(record_type: str, record_id: int, marked: bool) -> InlineKeyboardM
     return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f'xls_{record_type}|{record_id}')]])
 
 
-def ocr_mode_keyboard() -> InlineKeyboardMarkup:
+def bill_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton('💳 Обычный расход', callback_data='bill_single'),
+        InlineKeyboardButton('🧾 Общий счёт',     callback_data='bill_combined'),
+    ]])
+
+
+def combined_bill_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton('➕ Добавить позицию', callback_data='cb_add'),
+            InlineKeyboardButton('✅ Завершить',         callback_data='cb_finish'),
+        ],
+        [
+            InlineKeyboardButton('✏️ Изменить',          callback_data='cb_edit_menu'),
+            InlineKeyboardButton('🗑 Удалить',            callback_data='cb_del_menu'),
+        ],
+        [InlineKeyboardButton('❌ Отмена',               callback_data='cb_cancel')],
+    ])
+
+
+def cb_delete_keyboard(positions: list) -> InlineKeyboardMarkup:
+    rows = []
+    for i, pos in enumerate(positions):
+        label = f'🗑 #{i+1} — {pos["amount"]:.2f} | {pos["category"]} | {pos["description"] or "—"}'
+        rows.append([InlineKeyboardButton(label, callback_data=f'cb_del|{i}')])
+    rows.append([InlineKeyboardButton('◀️ Назад', callback_data='cb_back')])
+    return InlineKeyboardMarkup(rows)
+
+
+def cb_edit_keyboard(positions: list) -> InlineKeyboardMarkup:
+    rows = []
+    for i, pos in enumerate(positions):
+        label = f'✏️ #{i+1} — {pos["amount"]:.2f} | {pos["category"]} | {pos["description"] or "—"}'
+        rows.append([InlineKeyboardButton(label, callback_data=f'cb_edit|{i}')])
+    rows.append([InlineKeyboardButton('◀️ Назад', callback_data='cb_back')])
+    return InlineKeyboardMarkup(rows)
+
+
+def cb_edit_field_keyboard(idx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton('💰 Сумма',     callback_data=f'cb_editamt|{idx}'),
+            InlineKeyboardButton('🏷 Категория', callback_data=f'cb_editcat|{idx}'),
+            InlineKeyboardButton('📝 Описание',  callback_data=f'cb_editdesc|{idx}'),
+        ],
+        [InlineKeyboardButton('◀️ Назад', callback_data='cb_edit_menu')],
+    ])
+
+
+def cb_cat_keyboard(idx: int) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for k, v in EXP_CATEGORIES.items():
+        row.append(InlineKeyboardButton(v, callback_data=f'cb_setcat|{idx}|{k}'))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def cb_pos_cat_keyboard() -> InlineKeyboardMarkup:
+    """Category keyboard for new combined bill position."""
+    rows, row = [], []
+    for k, v in EXP_CATEGORIES.items():
+        row.append(InlineKeyboardButton(v, callback_data=f'cb_poscat|{k}'))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+
     return InlineKeyboardMarkup([[
         InlineKeyboardButton('📋 По строкам',     callback_data='rl_start'),
         InlineKeyboardButton('💰 Одна категория', callback_data='rl_one'),
@@ -259,7 +330,125 @@ async def _post_income(context, inc_id, amount, category, description, date, use
         db.set_income_message(inc_id, int(db.get_config('group_id')), msg.message_id)
 
 
-# ── Budget check ──────────────────────────────────────────────────────────────
+# ── Combined bill helpers ─────────────────────────────────────────────────────
+def _cb_summary_text(cb: dict) -> str:
+    """Build the combined bill running summary message."""
+    positions  = cb.get('positions', [])
+    total      = cb.get('total', 0.0)
+    pos_total  = sum(p['amount'] for p in positions)
+    diff       = round(total - pos_total, 2)
+    store      = cb.get('description', '')
+    store_line = f' — {store}' if store else ''
+
+    text = f'🧾 <b>Общий счёт{store_line}</b>\n'
+    text += f'💰 Итого: <code>{total:.2f} CAD</code>\n\n'
+
+    if positions:
+        for i, pos in enumerate(positions):
+            prefix = '└' if i == len(positions) - 1 else '├'
+            text += f'{prefix} {i+1}. <code>{pos["amount"]:.2f}</code> | {pos["category"]} | {pos["description"] or "—"}\n'
+        text += f'\n<b>Позиций:</b> <code>{pos_total:.2f}</code> / <code>{total:.2f} CAD</code>'
+        if diff > 0.005:
+            text += f'\n⚠️ Разница (HST): <code>+{diff:.2f} CAD</code> — будет распределена равномерно'
+        elif diff < -0.005:
+            text += f'\n⚠️ Сумма позиций превышает счёт на <code>{abs(diff):.2f} CAD</code>'
+        else:
+            text += '\n✅ Сумма сходится'
+    else:
+        text += '<i>Позиций пока нет. Добавьте первую.</i>'
+
+    return text
+
+
+async def _post_combined_bill(context, positions: list, total: float,
+                               description: str, date: str, username: str,
+                               exp_ids: list):
+    """Post ONE combined bill message to expenses topic."""
+    diff     = round(total - sum(p['amount'] for p in positions), 2)
+    hst_line = f' (HST +{diff:.2f})' if diff > 0.005 else ''
+    store    = f' — {description}' if description else ''
+
+    text = f'🧾 <b>Общий счёт{store}{hst_line}</b>\n💰 <code>{total:.2f} CAD</code>\n\n'
+
+    for i, pos in enumerate(positions):
+        prefix  = '└' if i == len(positions) - 1 else '├'
+        adj     = pos.get('adjusted', pos['amount'])
+        amt_str = (f'<code>{pos["amount"]:.2f}</code> → <code>{adj:.2f}</code>'
+                   if abs(adj - pos['amount']) > 0.005
+                   else f'<code>{adj:.2f}</code>')
+        text += f'{prefix} {amt_str} | {pos["category"]} | {pos["description"] or "—"}\n'
+
+    text += f'\n📅 {date}  👤 {username}'
+
+    # Use first exp_id for the Excel button — marks all when tapped
+    markup = excel_btn('e', exp_ids[0], False) if exp_ids else None
+    msg    = await _send_to_topic(context, 'topic_expenses', text, markup)
+    if msg and exp_ids:
+        gid = int(db.get_config('group_id'))
+        # Store message reference on first position only
+        db.set_expense_message(exp_ids[0], gid, msg.message_id)
+
+
+async def _finalize_combined_bill(query, context, user):
+    """Distribute HST, save all positions, post combined message."""
+    cb        = context.user_data.get('combined_bill', {})
+    positions = cb.get('positions', [])
+    total     = cb.get('total', 0.0)
+    date      = cb.get('date', datetime.now().strftime('%Y-%m-%d'))
+    desc      = cb.get('description', '')
+
+    if not positions:
+        await query.edit_message_text('❌ Нет позиций для сохранения.')
+        return
+
+    pos_total = sum(p['amount'] for p in positions)
+    diff      = round(total - pos_total, 2)
+
+    # Distribute difference equally
+    if abs(diff) > 0.005:
+        share = diff / len(positions)
+        for pos in positions:
+            pos['adjusted'] = round(pos['amount'] + share, 2)
+        # Fix rounding on last item
+        adj_sum = sum(p['adjusted'] for p in positions)
+        positions[-1]['adjusted'] += round(total - adj_sum, 2)
+    else:
+        for pos in positions:
+            pos['adjusted'] = pos['amount']
+
+    # Save each position to DB
+    exp_ids  = []
+    username = user.username or user.first_name
+    for pos in positions:
+        eid = db.add_expense(
+            user_id=user.id, username=username,
+            amount=pos['adjusted'], category=pos['category'],
+            description=pos['description'], date=date,
+        )
+        exp_ids.append(eid)
+
+    # Post combined message to topic
+    await _post_combined_bill(context, positions, total, desc, date, username, exp_ids)
+
+    context.user_data.pop('combined_bill', None)
+
+    # Build confirmation
+    hst_note = f'\n⚖️ HST <code>+{diff:.2f} CAD</code> распределён по позициям' if diff > 0.005 else ''
+    await query.edit_message_text(
+        f'✅ <b>Общий счёт сохранён!</b>\n'
+        f'💰 {total:.2f} CAD | {len(positions)} позиций{hst_note}\n\n'
+        f'Отправлено в Расходы одним сообщением.',
+        parse_mode='HTML'
+    )
+
+    # Budget checks
+    for pos in positions:
+        try:
+            await _check_budget(query, pos['category'], pos['adjusted'])
+        except Exception:
+            pass
+
+
 async def _check_budget(update_or_query, category: str, amount: float):
     budget = db.get_budget(category)
     if not budget:
@@ -366,7 +555,7 @@ async def _save_and_next_line(query, context, category: str):
 def _exp_preview(amount: float, description: str, date: str = None) -> str:
     desc     = f'\n📝 {description}' if description else ''
     date_str = f'\n📅 {date}' if date and date != datetime.now().strftime('%Y-%m-%d') else ''
-    return f'💰 <b>{amount:.2f} CAD</b>{desc}{date_str}\n\nВыберите категорию:'
+    return f'💰 <b>{amount:.2f} CAD</b>{desc}{date_str}\n\nВыберите тип расхода:'
 
 
 def _line_prompt(context) -> str:
@@ -469,7 +658,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     description, date = _parse_date(raw_desc)
     _store_pending(context, amount, description, date)
     await update.message.reply_text(
-        _exp_preview(amount, description, date), reply_markup=cat_keyboard(), parse_mode='HTML'
+        _exp_preview(amount, description, date), reply_markup=bill_type_keyboard(), parse_mode='HTML'
     )
 
 
@@ -803,6 +992,73 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user = update.effective_user
 
+    # ── Combined bill states ───────────────────────────────────────────────
+    if context.user_data.get('cb_waiting_total'):
+        context.user_data.pop('cb_waiting_total', None)
+        try:
+            total = float(text.replace(',', '.'))
+        except ValueError:
+            await update.message.reply_text('❌ Введите только число: <code>250.50</code>', parse_mode='HTML')
+            return
+        cb           = context.user_data.get('combined_bill', {})
+        cb['total']  = total
+        context.user_data['combined_bill'] = cb
+        await update.message.reply_text(
+            _cb_summary_text(cb), reply_markup=combined_bill_keyboard(), parse_mode='HTML'
+        )
+        return
+
+    if context.user_data.get('cb_waiting_pos_amount'):
+        context.user_data.pop('cb_waiting_pos_amount', None)
+        try:
+            amount = float(text.replace(',', '.'))
+        except ValueError:
+            await update.message.reply_text('❌ Введите только число.', parse_mode='HTML')
+            return
+        context.user_data['cb_pos_amount'] = amount
+        await update.message.reply_text(
+            f'💰 <b>{amount:.2f} CAD</b>\n\nВыберите категорию:',
+            reply_markup=cb_pos_cat_keyboard(), parse_mode='HTML'
+        )
+        return
+
+    if context.user_data.get('cb_waiting_pos_desc'):
+        context.user_data.pop('cb_waiting_pos_desc', None)
+        cb  = context.user_data.get('combined_bill', {})
+        pos = context.user_data.pop('cb_pending_pos', {})
+        pos['description'] = '' if text.strip() == '-' else text
+        cb.setdefault('positions', []).append(pos)
+        context.user_data['combined_bill'] = cb
+        await update.message.reply_text(
+            _cb_summary_text(cb), reply_markup=combined_bill_keyboard(), parse_mode='HTML'
+        )
+        return
+
+    if context.user_data.get('cb_waiting_edit_amount') is not None:
+        idx = context.user_data.pop('cb_waiting_edit_amount')
+        try:
+            amount = float(text.replace(',', '.'))
+        except ValueError:
+            await update.message.reply_text('❌ Введите только число.'); return
+        cb = context.user_data.get('combined_bill', {})
+        cb['positions'][idx]['amount'] = amount
+        context.user_data['combined_bill'] = cb
+        await update.message.reply_text(
+            _cb_summary_text(cb), reply_markup=combined_bill_keyboard(), parse_mode='HTML'
+        )
+        return
+
+    if context.user_data.get('cb_waiting_edit_desc') is not None:
+        idx = context.user_data.pop('cb_waiting_edit_desc')
+        cb  = context.user_data.get('combined_bill', {})
+        cb['positions'][idx]['description'] = text
+        context.user_data['combined_bill'] = cb
+        await update.message.reply_text(
+            _cb_summary_text(cb), reply_markup=combined_bill_keyboard(), parse_mode='HTML'
+        )
+        return
+
+    # ── Regular expense states ─────────────────────────────────────────────
     if context.user_data.get('waiting_description'):
         context.user_data.pop('waiting_description', None)
         await _finalize_expense(update.message, context, user, description_override=text)
@@ -817,7 +1073,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('waiting_for_amount', None)
         _store_pending(context, amount, 'Чек (фото)')
         await update.message.reply_text(
-            _exp_preview(amount, 'Чек (фото)'), reply_markup=cat_keyboard(), parse_mode='HTML'
+            _exp_preview(amount, 'Чек (фото)'), reply_markup=bill_type_keyboard(), parse_mode='HTML'
         )
         return
 
@@ -832,7 +1088,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _store_pending(context, amount, last.get('description', ''))
         await update.message.reply_text(
             _exp_preview(amount, last.get('description', '')),
-            reply_markup=cat_keyboard(), parse_mode='HTML'
+            reply_markup=bill_type_keyboard(), parse_mode='HTML'
         )
         return
 
@@ -860,12 +1116,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = float(match.group(1).replace(',', '.'))
     except ValueError:
         return
-    raw_desc    = match.group(2).strip()
+    raw_desc          = match.group(2).strip()
     description, date = _parse_date(raw_desc)
     _store_pending(context, amount, description, date)
     await update.message.reply_text(
-        _exp_preview(amount, description, date), reply_markup=cat_keyboard(), parse_mode='HTML'
+        _exp_preview(amount, description, date),
+        reply_markup=bill_type_keyboard(),
+        parse_mode='HTML'
     )
+
+
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -913,6 +1173,132 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f'CB [{user.username or user.id}]: {data}')
 
     try:
+        # ── Bill type choice ──────────────────────────────────────────────
+        if data == 'bill_single':
+            # Regular expense — proceed to category keyboard
+            pending = context.user_data.get('pending')
+            if not pending:
+                await query.edit_message_text('❌ Сессия истекла.'); return
+            await query.edit_message_text(
+                f'💰 <b>{pending["amount"]:.2f} CAD</b>'
+                + (f'\n📝 {pending["description"]}' if pending.get('description') else '')
+                + '\n\nВыберите категорию:',
+                reply_markup=cat_keyboard(), parse_mode='HTML'
+            )
+
+        elif data == 'bill_combined':
+            pending = context.user_data.pop('pending', {})
+            context.user_data['combined_bill'] = {
+                'total':       pending.get('amount', 0.0),
+                'description': pending.get('description', ''),
+                'date':        pending.get('date', datetime.now().strftime('%Y-%m-%d')),
+                'positions':   [],
+            }
+            cb = context.user_data['combined_bill']
+            await query.edit_message_text(
+                _cb_summary_text(cb), reply_markup=combined_bill_keyboard(), parse_mode='HTML'
+            )
+
+        # ── Combined bill actions ──────────────────────────────────────────
+        elif data == 'cb_add':
+            context.user_data['cb_waiting_pos_amount'] = True
+            await query.edit_message_text('➕ Введите сумму позиции:')
+
+        elif data.startswith('cb_poscat|'):
+            cat_key  = data.split('|')[1]
+            category = EXP_CATEGORIES.get(cat_key, '📦 Другое')
+            amount   = context.user_data.pop('cb_pos_amount', 0.0)
+            context.user_data['cb_pending_pos']       = {'amount': amount, 'category': category}
+            context.user_data['cb_waiting_pos_desc']  = True
+            await query.edit_message_text(
+                f'💰 {amount:.2f} CAD  |  {category}\n\n📝 Введите описание или отправьте <code>-</code> чтобы пропустить:',
+                parse_mode='HTML'
+            )
+
+        elif data == 'cb_del_menu':
+            cb = context.user_data.get('combined_bill', {})
+            positions = cb.get('positions', [])
+            if not positions:
+                await query.answer('Нет позиций для удаления.'); return
+            await query.edit_message_text(
+                '🗑 <b>Выберите позицию для удаления:</b>',
+                reply_markup=cb_delete_keyboard(positions), parse_mode='HTML'
+            )
+
+        elif data.startswith('cb_del|'):
+            idx = int(data.split('|')[1])
+            cb  = context.user_data.get('combined_bill', {})
+            positions = cb.get('positions', [])
+            if 0 <= idx < len(positions):
+                removed = positions.pop(idx)
+                cb['positions'] = positions
+                context.user_data['combined_bill'] = cb
+                await query.answer(f'✅ Удалено: {removed["category"]}')
+            await query.edit_message_text(
+                _cb_summary_text(cb), reply_markup=combined_bill_keyboard(), parse_mode='HTML'
+            )
+
+        elif data == 'cb_edit_menu':
+            cb = context.user_data.get('combined_bill', {})
+            positions = cb.get('positions', [])
+            if not positions:
+                await query.answer('Нет позиций для редактирования.'); return
+            await query.edit_message_text(
+                '✏️ <b>Выберите позицию для редактирования:</b>',
+                reply_markup=cb_edit_keyboard(positions), parse_mode='HTML'
+            )
+
+        elif data.startswith('cb_edit|'):
+            idx = int(data.split('|')[1])
+            await query.edit_message_text(
+                f'✏️ <b>Позиция #{idx+1}</b> — что изменить?',
+                reply_markup=cb_edit_field_keyboard(idx), parse_mode='HTML'
+            )
+
+        elif data.startswith('cb_editamt|'):
+            idx = int(data.split('|')[1])
+            context.user_data['cb_waiting_edit_amount'] = idx
+            await query.edit_message_text(f'💰 Введите новую сумму для позиции #{idx+1}:')
+
+        elif data.startswith('cb_editcat|'):
+            idx = int(data.split('|')[1])
+            await query.edit_message_text(
+                f'🏷 Выберите новую категорию для позиции #{idx+1}:',
+                reply_markup=cb_cat_keyboard(idx)
+            )
+
+        elif data.startswith('cb_setcat|'):
+            parts    = data.split('|')
+            idx      = int(parts[1])
+            category = EXP_CATEGORIES.get(parts[2], '📦 Другое')
+            cb       = context.user_data.get('combined_bill', {})
+            cb['positions'][idx]['category'] = category
+            context.user_data['combined_bill'] = cb
+            await query.edit_message_text(
+                _cb_summary_text(cb), reply_markup=combined_bill_keyboard(), parse_mode='HTML'
+            )
+
+        elif data.startswith('cb_editdesc|'):
+            idx = int(data.split('|')[1])
+            context.user_data['cb_waiting_edit_desc'] = idx
+            await query.edit_message_text(f'📝 Введите новое описание для позиции #{idx+1}:')
+
+        elif data == 'cb_back':
+            cb = context.user_data.get('combined_bill', {})
+            await query.edit_message_text(
+                _cb_summary_text(cb), reply_markup=combined_bill_keyboard(), parse_mode='HTML'
+            )
+
+        elif data == 'cb_finish':
+            cb = context.user_data.get('combined_bill', {})
+            if not cb.get('positions'):
+                await query.answer('❌ Добавьте хотя бы одну позицию.'); return
+            await _finalize_combined_bill(query, context, user)
+
+        elif data == 'cb_cancel':
+            context.user_data.pop('combined_bill', None)
+            await query.edit_message_text('❌ Общий счёт отменён.')
+
         # ── Receipt ───────────────────────────────────────────────────────
         if data == 'rl_start':
             receipt = context.user_data.get('receipt')
@@ -928,7 +1314,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not amount:
                 await query.edit_message_text('❌ Нет данных.'); return
             _store_pending(context, amount, 'Чек (фото)')
-            await query.edit_message_text(_exp_preview(amount, 'Чек (фото)'), reply_markup=cat_keyboard(), parse_mode='HTML')
+            await query.edit_message_text(_exp_preview(amount, 'Чек (фото)'), reply_markup=bill_type_keyboard(), parse_mode='HTML')
 
         elif data.startswith('rlcat|'):
             await _save_and_next_line(query, context, EXP_CATEGORIES.get(data.split('|')[1], '📦 Другое'))
@@ -983,7 +1369,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not amount:
                 await query.edit_message_text('❌ Сессия истекла.'); return
             _store_pending(context, amount, 'Чек (фото)')
-            await query.edit_message_text(_exp_preview(amount, 'Чек (фото)'), reply_markup=cat_keyboard(), parse_mode='HTML')
+            await query.edit_message_text(_exp_preview(amount, 'Чек (фото)'), reply_markup=bill_type_keyboard(), parse_mode='HTML')
 
         elif data == 'ocr_edit':
             context.user_data.pop('ocr_amount', None)
