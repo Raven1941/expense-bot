@@ -1137,13 +1137,33 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now().strftime('%Y-%m-%d')
 
     if lines:
-        context.user_data['receipt'] = {'lines': lines, 'index': 0, 'total': total, 'date': today}
-        if total:
-            context.user_data['ocr_amount'] = total
+        # Auto-load all lines into combined bill
+        # Category defaults to 📦 Другое — user will edit before saving
+        positions = [
+            {
+                'amount':      item['amount'],
+                'category':    '📦 Другое',
+                'description': item['name'],
+            }
+            for item in lines
+        ]
+        cb = {
+            'total':       total or round(sum(p['amount'] for p in positions), 2),
+            'description': 'Чек (фото)',
+            'date':        today,
+            'positions':   positions,
+        }
+        context.user_data['combined_bill'] = cb
         await status.edit_text(
-            _receipt_summary(lines, total), reply_markup=ocr_mode_keyboard(), parse_mode='HTML'
+            f'📄 <b>Чек прочитан — {len(lines)} позиций</b>\n\n'
+            + _cb_summary_text(cb)
+            + '\n\n<i>Измените названия и категории, затем нажмите ✅ Завершить.</i>',
+            reply_markup=combined_bill_keyboard(),
+            parse_mode='HTML'
         )
+
     elif total:
+        # No line items — single amount confirmation
         context.user_data['ocr_amount'] = total
         raw = (ocr_text[:400] + '…') if ocr_text and len(ocr_text) > 400 else (ocr_text or '—')
         await status.edit_text(
@@ -1162,6 +1182,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'📄 <b>Текст с чека:</b>\n<code>{raw}</code>\n\n❌ Сумма не найдена. Введите вручную:',
             parse_mode='HTML'
         )
+
+
 
 
 # ── Callback Handler ──────────────────────────────────────────────────────────
